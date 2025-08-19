@@ -206,6 +206,8 @@ Recalibration command
 
 ## Repository Layout (proposed)
 
+Note: only implement `motion_detection` and `testing`. Everything else is already implemented.
+
 ```
 /src
 ├─ /app
