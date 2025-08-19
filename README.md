@@ -1,200 +1,298 @@
-# Motion Detection Library – Orientation Change Detection with MotionFX
+# Motion Detection Library — Orientation Change Detection with MotionFX
 
 ## Overview
 
-This project implements a **robust motion detection application** using the STMicroelectronics **ISM330DHCX accelerometer and gyroscope** in combination with the **MotionFX Sensor Fusion Library**.
+Robust, long‑running motion/orientation detection for an outdoor, mostly static ISM330DHCX sensor using ST MotionFX. The goal is to detect abrupt orientation changes (azimuth/yaw and altitude/pitch) within seconds, while rejecting drift and wind‑induced oscillations, and to persist calibration and the reference orientation across power cycles.
 
-The goal is to **detect abrupt orientation changes** (azimuth and altitude) while ignoring drift and small oscillations caused by environmental disturbances such as wind, vibrations, or long-term sensor bias.
+Key capabilities:
+- Abrupt change detection with validation and hysteresis
+- WDS device orientation support via a fixed frame transform
+- Drift and vibration rejection (filtering + time series heuristics)
+- EEPROM persistence (gbias, thresholds, validation windows, reference quaternion)
+- Detailed console logging for analysis and field debug
 
-The system must be **robust enough to run for multiple days**, save and restore calibration across power cycles, and log events for diagnostics.
+Relevant spec: UM2220 — ST MotionFX Sensor Fusion Library (see References).
 
 ---
 
 ## System Description
 
-* **Hardware:** ISM330DHCX (accelerometer + gyroscope)
-* **Placement:** Sensor mounted on a 1m outdoor pole, in **WDS orientation** (West x-axis, Down y-axis, South z-axis).
-* **Sampling rate:** 104 Hz.
-* **Environment:** Mostly static; subject to wind and potential abrupt changes (e.g., earthquakes, forced rotations).
+- Hardware: ISM330DHCX (accelerometer + gyroscope)
+- Placement: Outdoor, on a 1 m pole; device axes are in WDS orientation (West x, Down y, South z)
+- Sampling rate: 104 Hz (accelerometer and gyroscope)
+- Environment: Mostly static; wind and occasional abrupt rotations possible
 
 ---
 
 ## Detection Requirements
 
-* **Azimuth threshold:** 10°
-* **Altitude threshold:** 5°
-* **Condition:** Event reported if an abrupt orientation change **exceeds thresholds within a few seconds** and remains stable for at least `n` minutes (will mostly be >60 minutes).
-* **Ignore:**
-
-  * Drift (sensor bias, long-term azimuth instability).
-  * Small oscillations from wind/vibrations.
+- Azimuth threshold: 10°
+- Altitude threshold: 5°
+- Condition: Report an event if orientation exceeds thresholds within a few seconds and then remains stable for at least n minutes (typically > 60 min)
+- Ignore: Slow drift (bias, long‑term azimuth instability) and small, short oscillations due to wind/vibrations
 
 ---
 
-## MotionFX Usage
+## Coordinate Frames and WDS Conversion
 
-* MotionFX provides sensor fusion (accelerometer + gyroscope → orientation quaternion).
-* WDS orientation is **not natively supported**; a **custom conversion function** is required to align MotionFX output with our coordinate system.
-* System must store and restore:
+MotionFX outputs orientation in its internal board frame. Our device uses WDS axes:
+- x_device = West = −East
+- y_device = Down = Down
+- z_device = South = −North
 
-  * **Gyroscope bias (gbias)**
-  * **Orientation reference quaternion**
-  * **Thresholds**
-  * **Validation time window**
+If MotionFX is configured for NED (x=N, y=E, z=D), the matrix that maps device‑frame vectors to NED is:
 
-Stored data is saved to **EEPROM** via `saveToEEPROM()`.
+```
+R_ned_from_wds = [  0  0 -1 ;  // N from WDS: z_device = South → −N
+                    -1  0  0 ;  // E from WDS: x_device = West → −E
+                     0  1  0 ]  // D from WDS: y_device = Down →  D
+```
+
+Use a fixed quaternion `q_ned_from_wds` derived from `R_ned_from_wds` to convert IMU samples and/or fused orientation to a consistent global frame. Apply the transform in a single place to avoid double rotations. For quaternions, compute the delta to the reference as:
+
+```
+q_delta = q_reference^{-1} ⊗ q_current
+```
+
+Extract yaw (azimuth) and pitch (altitude) from `q_delta`. Roll is ignored for event decisions but can be logged.
+
+---
+
+## Algorithm (Drift‑Resistant Orientation Change)
+
+1) Sensor fusion
+- Feed 104 Hz accel + gyro to MotionFX. Persist and restore gyro bias (gbias).
+
+2) Reference orientation
+- Maintain a persistent `q_reference`. On first install or after explicit recalibration, set `q_reference = q_current` once stable.
+
+3) Delta orientation
+- Compute `q_delta = inv(q_reference) ⊗ q_current` and convert to yaw/pitch (`azimuth`, `altitude`).
+
+4) Filtering and detection
+- Low‑pass filter (LPF) on yaw/pitch to remove sensor noise.
+- High‑pass/derivative gate to detect rapid changes (suppresses slow drift).
+- Peak/hold: if either |Δazimuth| ≥ 10° or |Δaltitude| ≥ 5° within T_detect (e.g., 2 s), enter Validation.
+
+5) Validation and hysteresis
+- Require stability for T_validate (e.g., 5–10 s): variance of yaw/pitch below small thresholds, gyro magnitude below quiet limit.
+- If validated, emit Event immediately. Start Hold state to ensure the new pose is not transient.
+- Hold: require continuous stability for T_hold = n minutes/hours before committing `q_reference = q_current` and persisting to EEPROM. If instability resumes, revert to Monitoring.
+
+6) Drift defenses
+- HPF/derivative gate blocks very low‑frequency motion (drift).
+- Azimuth bounding: because Ax and Ay are never both zero (sensor is tilted), compute yaw with gravity‑constrained projection to reduce heading drift.
+- Periodically re‑level small pitch drift only when gyro is quiet and no event is pending.
 
 ---
 
 ## State Machine
 
-The library operates as a **state machine**:
+States
+- Init → Calibration → Idle → Monitoring → Validation → Event → HoldCommit → Monitoring
+- Error is reachable from any state.
 
-1. **Initialization**
-
-   * Configure MotionFX.
-   * Load calibration and reference orientation from EEPROM.
-
-2. **Calibration**
-
-   * Estimate sensor bias (gyro offset, accelerometer tilt reference).
-   * Wait until stable.
-
-3. **Idle**
-
-   * Low activity; waiting for significant changes.
-
-4. **Monitoring**
-
-   * Process sensor fusion at 104 Hz.
-   * Track azimuth/altitude changes relative to reference.
-   * Apply filters to suppress drift and oscillations.
-
-5. **Validation**
-
-   * Confirm if detected orientation exceeds threshold for a **minimum duration** (e.g., 2–5 seconds).
-   * Reject transient events (wind gusts, short shocks).
-
-6. **Event**
-
-   * Log abrupt orientation change.
-   * Update reference orientation.
-   * Store new orientation in EEPROM.
-
-7. **Error**
-
-   * Entered if calibration or sensor fusion fails.
-   * Requires reset or recalibration.
+Transitions (summary)
+- Init: load EEPROM (gbias, thresholds, windows, `q_reference`), configure MotionFX
+- Calibration: estimate gbias (stationary), capture initial `q_reference`
+- Idle: low activity; escalate to Monitoring on movement or timer
+- Monitoring: compute filtered yaw/pitch deltas; if threshold within T_detect → Validation
+- Validation: require stability for T_validate; pass → Event, fail → Monitoring
+- Event: log once; begin HoldCommit timer
+- HoldCommit: require stability for T_hold; pass → persist `q_reference`, return to Monitoring; fail → Monitoring
+- Error: log, wait for reset or recalibrate
 
 ---
 
-## Filtering and Drift Handling
+## Filtering and Time‑Series Heuristics
 
-* **Low-pass filter** to smooth sensor noise.
-* **High-pass filter** to detect abrupt changes.
-* **Wave/time series analysis** to distinguish:
-
-  * **Drift** (slow bias, low frequency, ignored).
-  * **Abrupt events** (fast change, high frequency, validated).
-* Physics consideration:
-
-  * Since `Ax` and `Ay` are never both zero (pole tilt assumption), azimuth drift can be bounded.
-  * Long-term gyroscope drift is corrected by MotionFX fusion.
+- LPF: first‑order IIR on yaw/pitch (fc ≈ 1–2 Hz) to reduce noise.
+- HPF or derivative threshold on yaw/pitch (fc ≈ 0.05–0.1 Hz) to reject drift.
+- Gyro quiet check: |ω| RMS < ω_quiet (e.g., 0.5–1.0 °/s) for stability decisions.
+- Short‑term variance window (0.5–2 s) to confirm stability in Validation/Hold.
+- Spike rejector: ignore single‑sample outliers using median‑of‑3 or Hampel filter.
 
 ---
 
-## Software Architecture
+## Persistence (EEPROM)
 
-### File Structure
+Persist the following structure via `saveToEEPROM` and restore on boot:
+- gbias (3×float)
+- q_reference (4×float, normalized)
+- thresholds: azimuth_deg, altitude_deg
+- windows: T_detect (s), T_validate (s), T_hold (min)
+- firmware data version (uint16_t) for compatibility
 
-```
-/src
-├── /app
-├──── globals.cpp # Implemented - stores shared classes like `console`, `eeprom`, ... and our motion detection class.
-├──── eeprom.cpp # Implemented - stores data that we need after shut downs. Only read/write here once or twice a day.
-├──── accelerometer_thread.cpp # Implemented - sets up everything for the accelerometer, initializes our library, sends updates of the data (acc + gyro + timestamp) and collects intterupts/events from ISM330.
-├──── /motion_detection # Not implemented (TODO)
-        ├── motion_detection.cpp     # Core state machine, orientation detection
-        ├── motion_detection.h       # Public API
-        ├── quaternion.cpp           # Quaternion math, orientation conversions
-        ├── filters.cpp              # Low-pass / high-pass filters
-        ├── storage.cpp              # EEPROM save/load functions
-        ├── logging.cpp              # Wrappers for console logging
-├──── /testing # Not implemented (TODO)
-        ├── console_reader.py # read all data from console (COM4)
-        ├── motion_analysis.py # collect all console into .txt and store clean data in csvs for analysis later on.
-        ├── motion_analysis.ipynb # analyse the csvs for statistical patterns, frequencies, movements, gbias, ... and to compare with other runs.
-```
+Commit policy
+- Write sparingly (upon HoldCommit success or explicit SaveState) to minimize wear.
 
-### Public API (motion\_detection.h)
+---
+
+## Public API (C/C++)
 
 ```cpp
-// Initialize system (loads calibration + reference from EEPROM)
-void MotionDetection_Init();
+// Initialization / lifecycle
+void MotionDetection_Init();              // Load EEPROM, configure MotionFX
+void MotionDetection_Calibrate();         // Stationary bias calib + set q_reference
+void MotionDetection_SaveState();         // Force persist to EEPROM
+void MotionDetection_GetStateEEPROM();    // Load persisted state
 
-// Process one sensor update (accel + gyro + timestamp)
+// Data ingress (called by accelerometer thread at 104 Hz)
 void MotionDetection_Update(float ax, float ay, float az,
                             float gx, float gy, float gz,
                             uint32_t timestamp);
-// Set threshold calibration sequence
-void MotionDetection_set_thresholds(float altitude_threshold, float azimuth_threshold);
-// Trigger calibration sequence
-void MotionDetection_Calibrate();
 
-// Force-save current state to EEPROM
-void MotionDetection_SaveState();
+// Configuration
+void MotionDetection_set_thresholds(float altitude_deg, float azimuth_deg);
+void MotionDetection_set_windows(float t_detect_s, float t_validate_s, float t_hold_min);
 
-// Collect from EEPROM on restart
-void MotionDetection_GetStateEEPROM();
+// Diagnostics (optional)
+void MotionDetection_GetDeltas(float* azimuth_deg, float* altitude_deg);
+void MotionDetection_GetState(char* state_str_buf, uint32_t buf_len);
 ```
+
+Integration contract
+- An external accelerometer thread owns device I/O and calls `MotionDetection_Update(...)` at 104 Hz with a monotonically increasing `timestamp`.
+- A global `console` is available for logging. A global `eeprom` exposes `saveToEEPROM()`.
 
 ---
 
-## Logging
+## Logging (Console)
 
-The system provides detailed logs using `console->printOutput()` and `console->printOutputWOTime()`.
+Use `console->printOutput()` and `console->printOutputWOTime()` only. Avoid advanced format specifiers.
 
-Examples:
+Examples
+```cpp
+console->printOutputWOTime("%s\n", "MotionDetection Initialized");
+console->printOutput("State %s | dAz %f deg | dAlt %f deg\n", stateStr, dAz, dAlt);
+console->printOutput("Event | az %f | alt %f | t %u\n", dAz, dAlt, timestamp);
+```
+
+Recommended periodic logs
+- State transitions (from, to)
+- Threshold crossings with timestamps
+- Validation decisions (variance, gyro RMS)
+- EEPROM loads/saves and versions
+
+---
+
+## Calibration and Startup
+
+Cold start
+1) Init → try EEPROM; if version mismatch, fall back to Calibration
+2) Calibration: require gyro quiet; run gbias estimation; set `q_reference` once yaw/pitch are stable
+3) Persist state; enter Idle/Monitoring
+
+Recalibration command
+- Resets gbias and re‑levels `q_reference` when stationary. Wired to host command handler.
+
+---
+
+## Edge Cases and Robustness
+
+- Power loss between Event and HoldCommit: event logged, but reference not updated; on reboot, delta remains large and will quickly re‑validate. This is acceptable and visible in logs.
+- Long‑term azimuth drift: constrained yaw from gravity projection (Ax, Ay ≠ 0) and HPF gate minimize false events.
+- Wind‑induced oscillations: fail Validation due to sustained variance and gyro not quiet.
+
+---
+
+## Performance Targets
+
+- CPU: light; most work in MotionFX + simple IIRs
+- RAM: small buffers for short windows (≤ 2 s at 104 Hz)
+- EEPROM: write only on state commits or operator request
+
+---
+
+## Repository Layout (proposed)
+
+```
+/src
+├─ /app
+│  ├─ globals.cpp                // console, eeprom, motion detection instance
+│  ├─ eeprom.cpp                 // thin wrappers to save/load blobs
+│  └─ accelerometer_thread.cpp   // sensor I/O, calls MotionDetection_Update
+└─ /motion_detection
+   ├─ motion_detection.h         // API, enums, configuration
+   ├─ motion_detection.cpp       // state machine, detection logic
+   ├─ quaternion.cpp             // quaternion math, frame transforms
+   ├─ filters.cpp                // LPF/HPF, variance, spike rejector
+   ├─ storage.cpp                // EEPROM serialization/deserialization
+   └─ logging.cpp                // console helpers and formatting
+
+/testing
+├─ console_reader.py             // serial capture
+├─ motion_analysis.py            // parse logs → CSV, compute stats
+└─ motion_analysis.ipynb         // exploratory analysis
+```
+
+Branching
+- main: stable releases
+- dev: integration branch
+- feature/motion_detection, feature/filters, feature/storage: focused workstreams with PRs into dev
+
+---
+
+## Configuration (defaults)
+
+- thresholds: azimuth=10°, altitude=5°
+- windows: T_detect=2 s, T_validate=5 s, T_hold=60 min
+- filters: LPF_fc=1.5 Hz, HPF_fc=0.08 Hz, gyro_quiet=0.8 °/s RMS
+
+All are persisted and can be changed via console commands.
+
+---
+
+## Example Usage
 
 ```cpp
-console->printOutput("Orientation Change in state: Azimuth %f, Altitude %f, State: ", az, alt);
-console->printOutputWOTime("%s\n", "MotionDetection Initialized"); // Note: it is better to create new line for this like this.
+// Startup
+MotionDetection_Init();
+
+// Optional: override defaults
+MotionDetection_set_thresholds(5.0f, 10.0f);
+MotionDetection_set_windows(2.0f, 6.0f, 120.0f);
+
+// In accelerometer thread @104 Hz
+MotionDetection_Update(ax, ay, az, gx, gy, gz, timestamp);
+
+// On operator command
+MotionDetection_Calibrate();
+MotionDetection_SaveState();
 ```
 
 ---
 
-## EEPROM Storage
+## Build and Integration Notes
 
-Persistent values:
-
-* `gbias` (gyro bias calibration).
-* `reference_quaternion`.
-* `thresholds` (azimuth, altitude).
-* `validation_time`.
-
-This allows restart with orientation continuity.
+- Include MotionFX library per UM2220 and initialize with 104 Hz configuration.
+- Ensure consistent unit conventions: accel in g, gyro in dps or rad/s as required by MotionFX.
+- Apply WDS→NED transform consistently (either pre‑fusion on raw data or post‑fusion on orientation, not both).
+- Timestamps must be monotonic; use data‑poll index at 104 Hz if no RTC is available.
 
 ---
 
-## Example Use Case
+## Testing and Analysis Toolkit
 
-1. Sensor is static for hours → No event.
-2. Earthquake occurs → Sensor pole tilts abruptly by 50° azimuth.
-3. System validates change (>10° azimuth within 2s, stable after).
-4. Event logged + new reference orientation saved.
-5. System resumes monitoring with updated baseline.
-
----
-
-## Future Work
-
-* Implement **adaptive thresholds** (different noise levels in calm vs. windy conditions).
-* Explore **machine learning classifiers** for vibration vs. true movement separation.
-* Add **remote command interface** (console-based commands for recalibration, threshold updates).
+- Record console output continuously; rotate logs daily.
+- Use `/testing/motion_analysis.py` to convert logs to CSV and compute:
+  - Δazimuth/Δaltitude time series, validation windows, variance, gyro RMS
+  - False‑positive/negative rates under wind vs. true moves
+- Notebooks (`motion_analysis.ipynb`) provide spectral views and parameter tuning guidance.
 
 ---
 
 ## References
 
-* [STMicroelectronics MotionFX Sensor Fusion Library – User Manual (UM2220)](https://www.st.com/resource/en/user_manual/um2220-getting-started-with-motionfx-sensor-fusion-library-in-xcubemems1-expansion-for-stm32cube-stmicroelectronics.pdf)
-* ISM330DHCX Datasheet
+- ST MotionFX Sensor Fusion Library — UM2220 (see link below)
+- ISM330DHCX datasheet and application notes
+
+UM2220: https://www.st.com/resource/en/user_manual/um2220-getting-started-with-motionfx-sensor-fusion-library-in-xcubemems1-expansion-for-stm32cube-stmicroelectronics.pdf
+
+---
+
+## Future Work
+
+- Adaptive thresholds based on wind/vibration level
+- ML‑assisted classification (vibration vs. true pose change)
+- Remote command interface (thresholds, windows, calibration)
