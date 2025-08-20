@@ -6,7 +6,11 @@
 #include <stdint.h>
 
 // Forward declarations for external integration points
-struct Console { void printOutput(const char* fmt, ...); void printOutputWOTime(const char* fmt, ...); };
+struct Console {
+    virtual ~Console() {}
+    virtual void printOutput(const char* fmt, ...) = 0;
+    virtual void printOutputWOTime(const char* fmt, ...) = 0;
+};
 extern Console* console;
 
 // External EEPROM helpers provided by the platform

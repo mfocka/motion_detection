@@ -184,12 +184,12 @@ static void runValidationAndHold() {
             if (g_ctx.hold_timer_s >= (g_ctx.windows.t_hold_min * 60.0f)) {
                 // Commit new reference orientation
                 g_ctx.q_reference = g_ctx.q_current;
-                StorageBlob blob;
+                storage::StorageBlob blob;
                 memset(&blob, 0, sizeof(blob));
                 blob.version = storage::kStorageVersion;
                 blob.thresholds = g_ctx.thresholds;
                 blob.windows = g_ctx.windows;
-                blob.gbias = { g_ctx.gbias.gx, g_ctx.gbias.gy, g_ctx.gbias.gz };
+                blob.gbias = GyroBias{ g_ctx.gbias.gx, g_ctx.gbias.gy, g_ctx.gbias.gz };
                 blob.q_reference = g_ctx.q_reference;
                 storage::save(blob);
                 console->printOutputWOTime("%s\n", "HoldCommit persisted");
@@ -211,11 +211,11 @@ void MotionDetection_Init() {
     resetFilters();
 
     // Load persisted state
-    StorageBlob blob;
+    storage::StorageBlob blob;
     if (storage::load(blob)) {
         g_ctx.thresholds = blob.thresholds;
         g_ctx.windows = blob.windows;
-        g_ctx.gbias = { blob.gbias.gx, blob.gbias.gy, blob.gbias.gz };
+        g_ctx.gbias = GyroBias{ blob.gbias.gx, blob.gbias.gy, blob.gbias.gz };
         g_ctx.q_reference = normalize(blob.q_reference);
         console->printOutputWOTime("%s\n", "EEPROM loaded");
     } else {
@@ -227,7 +227,7 @@ void MotionDetection_Init() {
     // Init MotionFX
     motionfx_wrapper::init_104hz();
     motionfx_wrapper::set_gbias(motionfx_wrapper::Gbias{ g_ctx.gbias.gx, g_ctx.gbias.gy, g_ctx.gbias.gz });
-    setState(DetectorState::Idle);
+    setState(DetectorState::Monitoring);
 }
 
 void MotionDetection_Calibrate() {
@@ -238,7 +238,7 @@ void MotionDetection_Calibrate() {
 }
 
 void MotionDetection_SaveState() {
-    StorageBlob blob;
+    storage::StorageBlob blob;
     memset(&blob, 0, sizeof(blob));
     blob.version = storage::kStorageVersion;
     blob.thresholds = g_ctx.thresholds;
@@ -250,7 +250,7 @@ void MotionDetection_SaveState() {
 }
 
 void MotionDetection_GetStateEEPROM() {
-    StorageBlob blob;
+    storage::StorageBlob blob;
     if (storage::load(blob)) {
         console->printOutput("EEPROM v %u | az %f | alt %f\n", (unsigned)blob.version, blob.thresholds.azimuth, blob.thresholds.altitude);
     } else {
@@ -284,7 +284,7 @@ void MotionDetection_Update(float ax_g, float ay_g, float az_g,
                 auto b = motionfx_wrapper::get_gbias();
                 g_ctx.gbias = GyroBias{ b.gx, b.gy, b.gz };
             }
-            g_ctx.q_reference = q_ned_current;
+        	g_ctx.q_reference = q_ned_current;
             console->printOutputWOTime("%s\n", "Calibration done");
             setState(DetectorState::Monitoring);
         }
@@ -326,5 +326,6 @@ void MotionDetection_GetState(char* state_str_buf, uint32_t buf_len) {
 }
 
 } // namespace motion_detection
+
 
 

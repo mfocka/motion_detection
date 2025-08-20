@@ -1,0 +1,6 @@
+EEPROM load failed
+State Init -> Idle
+Cfg thresholds | az 10.000000 | alt 5.000000
+Cfg windows | detect 2.000000 | validate 5.000000 | hold_min 60.000000
+FinalState,Idle
+FinalDeltas,0.000,0.000
