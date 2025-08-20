@@ -6,120 +6,87 @@
 #ifdef __has_include
 #  if __has_include(<motion_fx.h>)
 #    include <motion_fx.h>
-#    define HAVE_MOTIONFX 1
+#    define HAS_MFX_HEADER 1
 #  endif
 #endif
 
-#ifndef HAVE_MOTIONFX
-// Fallback: allow build without the library (no-op integration returning identity)
-#define HAVE_MOTIONFX 0
+#ifndef HAS_MFX_HEADER
+#define HAS_MFX_HEADER 0
 #endif
 
 namespace motionfx_wrapper {
 
 static Gbias s_bias{0.0f, 0.0f, 0.0f};
+static float s_dt = 1.0f / 104.0f;
 
-#if HAVE_MOTIONFX
-static MFX_output_t s_mfx_output;
-#ifdef MFX_knobs_t
+static uint8_t s_state_buffer[8192];
+static MFX_output_t s_output;
 static MFX_knobs_t s_knobs;
-#endif
 
 void init_104hz() {
-    // Initialize and configure defaults
-#ifdef MFX_init
-    MFX_init();
-#endif
-#ifdef MFX_setFrequency
-    MFX_setFrequency(104);
-#endif
-#ifdef MFX_enable6X
-    MFX_enable6X(1);
-#endif
-#ifdef MFX_getKnobs
-    MFX_getKnobs(&s_knobs);
-#ifdef MFX_setKnobs
-    MFX_setKnobs(&s_knobs);
-#endif
-#endif
+    // Initialize state
+    MotionFX_initialize((MFXState_t)s_state_buffer);
+    // Knobs
+    MotionFX_getKnobs((MFXState_t)s_state_buffer, &s_knobs);
+    // Default: 6X mode enabled by caller or here
+    MotionFX_enable_6X((MFXState_t)s_state_buffer, MFX_ENGINE_ENABLE);
 }
 
 void set_frequency_hz(int hz) {
-#ifdef MFX_setFrequency
-    MFX_setFrequency(hz);
-#else
-    (void)hz;
-#endif
+    if (hz > 0) s_dt = 1.0f / (float)hz;
 }
 
 void enable_6x(bool enable) {
-#ifdef MFX_enable6X
-    MFX_enable6X(enable ? 1 : 0);
-#else
-    (void)enable;
-#endif
+    MotionFX_enable_6X((MFXState_t)s_state_buffer, enable ? MFX_ENGINE_ENABLE : MFX_ENGINE_DISABLE);
 }
 
 void set_orientation(const char* orientation_str) {
-#ifdef MFX_setOrientation
-    MFX_setOrientation((char*)orientation_str);
-#elif defined(MotionFX_setOrientation)
-    MotionFX_setOrientation((char*)orientation_str);
-#else
-    (void)orientation_str;
-#endif
+    if (!orientation_str) return;
+    // Expect 3 chars (e/n/u or E/N/U). Apply to acc and gyro orientations.
+    s_knobs.acc_orientation[0] = orientation_str[0];
+    s_knobs.acc_orientation[1] = orientation_str[1];
+    s_knobs.acc_orientation[2] = orientation_str[2];
+    s_knobs.acc_orientation[3] = '\0';
+    s_knobs.gyro_orientation[0] = orientation_str[0];
+    s_knobs.gyro_orientation[1] = orientation_str[1];
+    s_knobs.gyro_orientation[2] = orientation_str[2];
+    s_knobs.gyro_orientation[3] = '\0';
+    s_knobs.output_type = MFX_ENGINE_OUTPUT_ENU;
+    MotionFX_setKnobs((MFXState_t)s_state_buffer, &s_knobs);
 }
 
 void set_knobs_raw(const void* knobs_struct) {
-#ifdef MFX_knobs_t
-    if (knobs_struct) {
-        memcpy(&s_knobs, knobs_struct, sizeof(MFX_knobs_t));
-#ifdef MFX_setKnobs
-        MFX_setKnobs(&s_knobs);
-#endif
-    }
-#else
-    (void)knobs_struct;
-#endif
+    if (!knobs_struct) return;
+    memcpy(&s_knobs, knobs_struct, sizeof(MFX_knobs_t));
+    MotionFX_setKnobs((MFXState_t)s_state_buffer, &s_knobs);
 }
 
 void set_gbias(const Gbias& b) {
     s_bias = b;
-    // If API supports direct bias set, apply here; otherwise keep locally
+    float gbias[3] = { b.gx, b.gy, b.gz };
+    MotionFX_setGbias((MFXState_t)s_state_buffer, gbias);
 }
 
 Gbias get_gbias() {
-    return s_bias;
+    float gbias[3] = {0,0,0};
+    MotionFX_getGbias((MFXState_t)s_state_buffer, gbias);
+    return Gbias{ gbias[0], gbias[1], gbias[2] };
 }
 
 Orientation update(float ax_g, float ay_g, float az_g,
                    float gx_dps, float gy_dps, float gz_dps) {
-    MFX_input_t in;
-    memset(&in, 0, sizeof(in));
-    // Inputs in g and dps per MotionFX API
+    MFX_input_t in{};
     in.acc[0] = ax_g; in.acc[1] = ay_g; in.acc[2] = az_g;
     in.gyro[0] = gx_dps - s_bias.gx;
     in.gyro[1] = gy_dps - s_bias.gy;
     in.gyro[2] = gz_dps - s_bias.gz;
-
-    MFX_update(&in, &s_mfx_output);
-    // Output quaternion order: w, x, y, z
-    return Orientation{ s_mfx_output.quaternion[0], s_mfx_output.quaternion[1], s_mfx_output.quaternion[2], s_mfx_output.quaternion[3] };
+    // No mag in 6X mode
+    float dt = s_dt;
+    MotionFX_propagate((MFXState_t)s_state_buffer, &in, &dt);
+    MotionFX_update((MFXState_t)s_state_buffer, &s_output, &in, &dt, nullptr);
+    return Orientation{ s_output.quaternion[0], s_output.quaternion[1], s_output.quaternion[2], s_output.quaternion[3] };
 }
 
-#else
-
-void init_104hz() {}
-void set_frequency_hz(int) {}
-void enable_6x(bool) {}
-void set_orientation(const char*) {}
-void set_knobs_raw(const void*) {}
-void set_gbias(const Gbias& b) { s_bias = b; }
-Gbias get_gbias() { return s_bias; }
-Orientation update(float, float, float, float, float, float) { return Orientation{1.0f, 0.0f, 0.0f, 0.0f}; }
-
-#endif
 
 } // namespace motionfx_wrapper
-
 
