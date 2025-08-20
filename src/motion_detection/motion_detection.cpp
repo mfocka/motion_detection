@@ -8,17 +8,9 @@
 #include "filters.h"
 #include "storage.h"
 #include "logging.h"
+#include "motionfx_wrapper.h"
 
-// MotionFX wrapper (stubbed here; platform must link actual library per UM2220)
-namespace motionfx_wrapper {
-struct Gbias { float gx; float gy; float gz; };
-struct Orientation { float qw; float qx; float qy; float qz; };
-void init_104hz();
-void set_gbias(const Gbias& b);
-Gbias get_gbias();
-Orientation update(float ax_g, float ay_g, float az_g,
-                   float gx_dps, float gy_dps, float gz_dps);
-}
+// MotionFX wrapper integrated via stm32duino MotionFX header
 
 namespace motion_detection {
 
